@@ -5,9 +5,9 @@ from insightface.app import FaceAnalysis
 from PIL import Image
 
 app = FastAPI()
-ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+ocr_instance = None
+face_app_instance = None
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -18,13 +18,30 @@ headers = {
     "Content-Type": "application/json"
 }
 
+def get_ocr():
+    global ocr_instance
+    if ocr_instance is None:
+        ocr_instance = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    return ocr_instance
+
+def get_face_app():
+    global face_app_instance
+    if face_app_instance is None:
+        face_app_instance = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        face_app_instance.prepare(ctx_id=0, det_size=(640, 640))
+    return face_app_instance
+
 def download_image(url: str) -> np.ndarray:
     resp = httpx.get(url, timeout=30)
+    resp.raise_for_status()
     img = Image.open(io.BytesIO(resp.content)).convert("RGB")
     return np.array(img)
 
 async def process_photo(photo_id: str, image_url: str):
     img = download_image(image_url)
+
+    ocr = get_ocr()
+    face_app = get_face_app()
 
     result = ocr.ocr(img, cls=True)
     numbers = []
@@ -56,6 +73,7 @@ async def process_photo(photo_id: str, image_url: str):
                     "h": bbox[3] - bbox[1]
                 }
             })
+
         httpx.post(
             f"{PROCESS_URL}?action=face_embeddings",
             json={"photo_id": photo_id, "faces": face_data},
@@ -71,16 +89,22 @@ async def process(photo_id: str, image_url: str, bg: BackgroundTasks):
 @app.post("/process-selfie")
 async def process_selfie(user_id: str, image_url: str):
     img = download_image(image_url)
+
+    face_app = get_face_app()
     faces = face_app.get(img)
+
     if not faces:
         return {"error": "Nenhum rosto detectado"}
+
     embedding = faces[0].embedding.tolist()
+
     httpx.post(
         f"{PROCESS_URL}?action=user_embedding",
         json={"user_id": user_id, "embedding": embedding},
         headers=headers,
         timeout=15
     )
+
     return {"status": "ok"}
 
 @app.get("/health")
