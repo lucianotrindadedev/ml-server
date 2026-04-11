@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+paddleocr==2.9.1
+paddlepaddle==2.6.2
+insightface==0.7.3
+onnxruntime==1.19.0
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+httpx==0.27.0
+Pillow==10.4.0
