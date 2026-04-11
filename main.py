@@ -2,6 +2,7 @@ import os
 import io
 import re
 from collections import Counter
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import httpx
 import numpy as np
@@ -16,6 +17,17 @@ ocr_instance = None
 face_app_instance = None
 
 ENV_SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+
+def append_query_params(url: str, params: dict) -> str:
+    """
+    Adiciona query params a uma URL sem quebrar se ela já tiver parâmetros.
+    """
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({k: v for k, v in params.items() if v is not None})
+    new_query = urlencode(query)
+    return urlunparse(parsed._replace(query=new_query))
 
 
 def get_ocr():
@@ -126,26 +138,20 @@ def generate_ocr_variants(img_np: np.ndarray) -> list[np.ndarray]:
     pil = Image.fromarray(img_np)
     variants = []
 
-    # original
     variants.append(np.array(pil))
 
-    # upscale 2x
     up2 = pil.resize((pil.width * 2, pil.height * 2), Image.Resampling.LANCZOS)
     variants.append(np.array(up2))
 
-    # grayscale
     gray = ImageOps.grayscale(up2).convert("RGB")
     variants.append(np.array(gray))
 
-    # contrast
     high_contrast = ImageEnhance.Contrast(gray).enhance(2.2)
     variants.append(np.array(high_contrast))
 
-    # sharpen
     sharp = high_contrast.filter(ImageFilter.SHARPEN)
     variants.append(np.array(sharp))
 
-    # extra sharpen + contrast
     extra = ImageEnhance.Contrast(sharp).enhance(1.4).filter(ImageFilter.SHARPEN)
     variants.append(np.array(extra))
 
@@ -157,19 +163,10 @@ def normalize_ocr_text(text: str) -> str:
 
 
 def is_plausible_bib_number(number: int) -> bool:
-    """
-    Para corrida de rua, bibs comuns:
-    - geralmente 2 a 4 dígitos
-    - aceita 1 dígito também em alguns eventos
-    """
     return 1 <= number <= 9999
 
 
 def score_number(number: int, confidence: float, source: str) -> float:
-    """
-    Dá prioridade para números encontrados no torso e com tamanho típico de bib.
-    Penaliza números improváveis como 2026 (muito comum em banner/ano da prova).
-    """
     score = confidence
 
     digit_len = len(str(number))
@@ -185,7 +182,6 @@ def score_number(number: int, confidence: float, source: str) -> float:
     elif source == "global":
         score += 0.05
 
-    # números que parecem ano costumam ser ruído visual
     if 1900 <= number <= 2100:
         score -= 0.80
 
@@ -219,7 +215,6 @@ def run_ocr_on_region(img_np: np.ndarray, source: str) -> list[tuple[int, float]
             if not digits:
                 continue
 
-            # evita números muito longos vindos de textos aleatórios
             if len(digits) > 4:
                 continue
 
@@ -239,13 +234,8 @@ def run_ocr_on_region(img_np: np.ndarray, source: str) -> list[tuple[int, float]
 
 
 def extract_torso_regions(img_np: np.ndarray) -> list[np.ndarray]:
-    """
-    Usa os rostos detectados para estimar a região do tronco/peito,
-    onde normalmente fica o número de corrida.
-    """
     face_app = get_face_app()
     faces = face_app.get(img_np)
-    h, w = img_np.shape[:2]
 
     regions = []
 
@@ -265,7 +255,6 @@ def extract_torso_regions(img_np: np.ndarray) -> list[np.ndarray]:
         fh = max(1, y2 - y1)
         cx = x1 + fw // 2
 
-        # Região estimada do peito/abdômen abaixo do rosto
         torso_x1 = int(cx - fw * 1.6)
         torso_x2 = int(cx + fw * 1.6)
         torso_y1 = int(y2 + fh * 0.4)
@@ -277,8 +266,6 @@ def extract_torso_regions(img_np: np.ndarray) -> list[np.ndarray]:
             continue
 
         ch, cw = crop.shape[:2]
-
-        # descarta recortes muito pequenos
         if cw < 50 or ch < 50:
             continue
 
@@ -293,10 +280,6 @@ def extract_torso_regions(img_np: np.ndarray) -> list[np.ndarray]:
 
 
 def select_best_bib_numbers(global_candidates: list[tuple[int, float]], torso_candidates: list[tuple[int, float]]) -> list[int]:
-    """
-    Junta candidatos globais e de torso, contando frequência e peso.
-    Prioriza torso, confiança e repetições.
-    """
     weighted_scores = Counter()
     occurrences = Counter()
 
@@ -317,19 +300,10 @@ def select_best_bib_numbers(global_candidates: list[tuple[int, float]], torso_ca
     for n in ranking:
         print(f"  number={n} | occurrences={occurrences[n]} | weighted_score={weighted_scores[n]:.3f}")
 
-    # limita a poucos resultados úteis
     return ranking[:6]
 
 
 def extract_bib_numbers(img_np: np.ndarray) -> list[int]:
-    """
-    Estratégia:
-    1. remove topo/rodapé
-    2. OCR global sem áreas de ruído
-    3. estima regiões de torso via rosto
-    4. OCR focado nos torsos
-    5. combina e ranqueia
-    """
     cleaned = remove_top_and_bottom_noise(img_np)
 
     print("Running OCR on cleaned global image...")
@@ -345,7 +319,6 @@ def extract_bib_numbers(img_np: np.ndarray) -> list[int]:
 
     final_numbers = select_best_bib_numbers(global_candidates, torso_candidates)
 
-    # filtragem final adicional: remove anos se houver outros candidatos melhores
     if len(final_numbers) > 1:
         filtered = [n for n in final_numbers if not (1900 <= n <= 2100)]
         if filtered:
@@ -367,8 +340,9 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str, s
 
         if numbers:
             print("BIB NUMBERS DETECTED:", numbers)
+            jersey_callback_url = append_query_params(callback_url, {"action": "jersey_numbers"})
             post_callback(
-                f"{callback_url}?action=jersey_numbers",
+                jersey_callback_url,
                 {
                     "photo_id": photo_id,
                     "jersey_numbers": numbers,
@@ -399,8 +373,9 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str, s
 
             print(f"FACES DETECTED: {len(face_data)}")
 
+            faces_callback_url = append_query_params(callback_url, {"action": "face_embeddings"})
             post_callback(
-                f"{callback_url}?action=face_embeddings",
+                faces_callback_url,
                 {
                     "photo_id": photo_id,
                     "faces": face_data,
@@ -460,8 +435,11 @@ async def process_selfie(
         embedding = faces[0].embedding.tolist()
         print("SELFIE FACE DETECTED")
 
+        # IMPORTANTE:
+        # Para o fluxo anônimo de selfie, usa o callback_url exatamente como veio,
+        # sem forçar ?action=user_embedding.
         post_callback(
-            f"{callback_url}?action=user_embedding",
+            callback_url,
             {
                 "user_id": user_id,
                 "embedding": embedding,
