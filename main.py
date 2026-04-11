@@ -12,7 +12,7 @@ app = FastAPI()
 ocr_instance = None
 face_app_instance = None
 
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+ENV_SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 
 def get_ocr():
@@ -57,9 +57,14 @@ def download_image(url: str) -> np.ndarray:
         raise HTTPException(status_code=400, detail=f"Erro ao baixar imagem: {str(e)}")
 
 
-def post_callback(callback_url: str, payload: dict):
+def post_callback(callback_url: str, payload: dict, service_role_key: str | None = None):
+    token = service_role_key or ENV_SUPABASE_SERVICE_KEY
+
+    if not token:
+        raise Exception("Nenhuma service_role_key disponível para o callback.")
+
     headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
@@ -67,6 +72,7 @@ def post_callback(callback_url: str, payload: dict):
     print("POST URL:", callback_url)
     print("HEADERS:", {"Authorization": "Bearer ***", "Content-Type": "application/json"})
     print("PAYLOAD:", payload)
+    print("TOKEN SOURCE:", "request" if service_role_key else "environment")
 
     try:
         with httpx.Client(timeout=60, follow_redirects=True) as client:
@@ -81,7 +87,7 @@ def post_callback(callback_url: str, payload: dict):
         raise Exception(f"Erro ao enviar callback: {str(e)}")
 
 
-async def process_photo_task(photo_id: str, image_url: str, callback_url: str):
+async def process_photo_task(photo_id: str, image_url: str, callback_url: str, service_role_key: str | None = None):
     try:
         print(f"Starting process_photo_task | photo_id={photo_id}")
         img = download_image(image_url)
@@ -115,6 +121,7 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str):
                     "photo_id": photo_id,
                     "jersey_numbers": unique_numbers,
                 },
+                service_role_key=service_role_key,
             )
         else:
             print("NO JERSEY NUMBERS DETECTED")
@@ -146,6 +153,7 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str):
                     "photo_id": photo_id,
                     "faces": face_data,
                 },
+                service_role_key=service_role_key,
             )
         else:
             print("NO FACES DETECTED")
@@ -157,23 +165,36 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str):
 
 
 @app.post("/process")
-async def process(photo_id: str, image_url: str, callback_url: str, bg: BackgroundTasks):
+async def process(
+    photo_id: str,
+    image_url: str,
+    callback_url: str,
+    bg: BackgroundTasks,
+    service_role_key: str | None = None
+):
     print("=== /process REQUEST RECEIVED ===")
     print("photo_id:", photo_id)
     print("image_url:", image_url)
     print("callback_url:", callback_url)
+    print("service_role_key received:", bool(service_role_key))
 
-    bg.add_task(process_photo_task, photo_id, image_url, callback_url)
+    bg.add_task(process_photo_task, photo_id, image_url, callback_url, service_role_key)
     return {"status": "queued"}
 
 
 @app.post("/process-selfie")
-async def process_selfie(user_id: str, image_url: str, callback_url: str):
+async def process_selfie(
+    user_id: str,
+    image_url: str,
+    callback_url: str,
+    service_role_key: str | None = None
+):
     try:
         print("=== /process-selfie REQUEST RECEIVED ===")
         print("user_id:", user_id)
         print("image_url:", image_url)
         print("callback_url:", callback_url)
+        print("service_role_key received:", bool(service_role_key))
 
         img = download_image(image_url)
 
@@ -193,6 +214,7 @@ async def process_selfie(user_id: str, image_url: str, callback_url: str):
                 "user_id": user_id,
                 "embedding": embedding,
             },
+            service_role_key=service_role_key,
         )
 
         return {"status": "ok"}
