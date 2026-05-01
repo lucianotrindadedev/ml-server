@@ -10,6 +10,8 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from paddleocr import PaddleOCR
 from insightface.app import FaceAnalysis
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from pydantic import BaseModel
+from typing import List, Optional
 
 app = FastAPI()
 
@@ -407,6 +409,26 @@ async def process(
 
     bg.add_task(process_photo_task, photo_id, image_url, callback_url, service_role_key)
     return {"status": "queued"}
+
+
+class PhotoItem(BaseModel):
+    photo_id: str
+    image_url: str
+
+class ProcessBatchRequest(BaseModel):
+    photos: List[PhotoItem]
+    callback_url: str
+    service_role_key: Optional[str] = None
+
+@app.post("/process-batch")
+async def process_batch(
+    req: ProcessBatchRequest,
+    bg: BackgroundTasks
+):
+    print(f"=== /process-batch REQUEST RECEIVED ({len(req.photos)} photos) ===")
+    for photo in req.photos:
+        bg.add_task(process_photo_task, photo.photo_id, photo.image_url, req.callback_url, req.service_role_key)
+    return {"status": "queued", "count": len(req.photos)}
 
 
 @app.post("/process-selfie")
