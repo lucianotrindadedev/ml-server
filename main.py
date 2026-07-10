@@ -369,7 +369,12 @@ def extract_bib_numbers(img_np: np.ndarray, faces: list) -> list[int]:
     return final_numbers
 
 
-async def process_photo_task(photo_id: str, image_url: str, callback_url: str, service_role_key: str | None = None):
+# NÃO usar async aqui: o processamento é 100% CPU síncrono (OCR/detecção). Como
+# função síncrona comum, o Starlette a executa num threadpool, deixando o event
+# loop livre para responder /health durante o processamento. Se fosse async, o
+# loop ficaria bloqueado, o healthcheck do Coolify falharia e o container seria
+# reiniciado no meio da fila (perdendo tudo que estava pendente).
+def process_photo_task(photo_id: str, image_url: str, callback_url: str, service_role_key: str | None = None):
     try:
         print(f"Starting process_photo_task | photo_id={photo_id}")
         img = download_image(image_url)
