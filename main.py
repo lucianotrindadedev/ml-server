@@ -1,12 +1,15 @@
 import os
 
 # Limita o número de threads das libs nativas (OpenMP/BLAS/onnxruntime) ANTES de
-# importar numpy/onnxruntime. Sem isso, cada worker tenta usar TODOS os núcleos,
-# causando oversubscription (mais lento) quando roda com múltiplos workers.
-# Ajuste ML_NUM_THREADS no Coolify conforme (núcleos / WEB_CONCURRENCY).
-_threads = os.environ.get("ML_NUM_THREADS", "2")
+# importar numpy/onnxruntime. O paralelismo entre fotos vem de múltiplos workers
+# uvicorn (WEB_CONCURRENCY), não de threads por operação — por isso o padrão é 1:
+# evita oversubscription e o PaddleOCR/OpenBLAS avisa (e pode falhar) com
+# OMP_NUM_THREADS > 1. Forçamos o valor (não usamos setdefault) para vencer um
+# OMP_NUM_THREADS herdado do ambiente/imagem base.
+# Regra: WEB_CONCURRENCY = núcleos - 1, ML_NUM_THREADS = 1.
+_threads = os.environ.get("ML_NUM_THREADS", "1")
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_var, _threads)
+    os.environ[_var] = _threads
 
 import io
 import re
