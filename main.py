@@ -10,6 +10,8 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUME
 
 import io
 import re
+import time
+import threading
 from collections import Counter
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -28,6 +30,20 @@ ocr_instance = None
 face_app_instance = None
 
 ENV_SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+ENV_SUPABASE_URL = os.environ.get("SUPABASE_URL") or os.environ.get("ML_SUPABASE_URL")
+
+# Worker que consome a fila de fotos pendentes automaticamente (sem depender do
+# navegador). Roda numa thread separada, então o processamento de CPU não bloqueia
+# o event loop / o /health. Com múltiplos workers uvicorn (WEB_CONCURRENCY>1),
+# cada processo roda sua própria thread e o claim usa SKIP LOCKED, dando
+# paralelismo real entre fotos sem processar a mesma foto duas vezes.
+WORKER_ENABLED = os.environ.get("ML_WORKER_ENABLED", "true").lower() not in ("0", "false", "no")
+WORKER_BATCH = int(os.environ.get("ML_WORKER_BATCH", "10"))
+WORKER_IDLE_SECONDS = float(os.environ.get("ML_WORKER_IDLE_SECONDS", "5"))
+
+# Protege a inicialização lazy dos modelos (singletons globais) contra corrida
+# entre a thread do worker e requisições de selfie chegando ao mesmo tempo.
+_model_init_lock = threading.Lock()
 
 # Fotos de corrida costumam vir em 4000-6000px. Processar nesse tamanho gasta
 # muita RAM (principal causa de OOM/travamento) e tempo, sem ganho de precisão
@@ -50,26 +66,31 @@ def append_query_params(url: str, params: dict) -> str:
 def get_ocr():
     global ocr_instance
     if ocr_instance is None:
-        print("Initializing PaddleOCR...")
-        ocr_instance = PaddleOCR(
-            use_angle_cls=True,
-            lang="en",
-            show_log=False
-        )
-        print("PaddleOCR initialized.")
+        with _model_init_lock:
+            if ocr_instance is None:
+                print("Initializing PaddleOCR...")
+                ocr_instance = PaddleOCR(
+                    use_angle_cls=True,
+                    lang="en",
+                    show_log=False
+                )
+                print("PaddleOCR initialized.")
     return ocr_instance
 
 
 def get_face_app():
     global face_app_instance
     if face_app_instance is None:
-        print("Initializing InsightFace...")
-        face_app_instance = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CPUExecutionProvider"]
-        )
-        face_app_instance.prepare(ctx_id=0, det_size=(640, 640))
-        print("InsightFace initialized.")
+        with _model_init_lock:
+            if face_app_instance is None:
+                print("Initializing InsightFace...")
+                instance = FaceAnalysis(
+                    name="buffalo_l",
+                    providers=["CPUExecutionProvider"]
+                )
+                instance.prepare(ctx_id=0, det_size=(640, 640))
+                face_app_instance = instance
+                print("InsightFace initialized.")
     return face_app_instance
 
 
@@ -436,10 +457,29 @@ def process_photo_task(photo_id: str, image_url: str, callback_url: str, service
         else:
             print("NO FACES DETECTED")
 
+        # Marca a foto como concluída (mesmo sem número/rosto detectado), para a
+        # fila saber que terminou e não reprocessar em loop.
+        _report_photo_status(callback_url, photo_id, "done", service_role_key)
         print(f"Finished process_photo_task | photo_id={photo_id}")
+        return True
 
     except Exception as e:
         print(f"ERROR in process_photo_task | photo_id={photo_id} | error={str(e)}")
+        _report_photo_status(callback_url, photo_id, "failed", service_role_key)
+        return False
+
+
+def _report_photo_status(callback_url: str, photo_id: str, status: str, service_role_key: str | None):
+    try:
+        status_url = append_query_params(callback_url, {"action": "photo_status"})
+        post_callback(
+            status_url,
+            {"photo_id": photo_id, "status": status},
+            service_role_key=service_role_key,
+        )
+    except Exception as e:
+        # Não deixa a falha do callback de status derrubar o processamento.
+        print(f"Failed to report photo_status={status} | photo_id={photo_id} | error={str(e)}")
 
 
 @app.post("/process")
@@ -529,3 +569,58 @@ async def process_selfie(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Worker automático da fila
+# ---------------------------------------------------------------------------
+
+def claim_ml_photos(batch_size: int) -> list[dict]:
+    """Reivindica um lote de fotos pendentes via RPC (atômico, SKIP LOCKED)."""
+    url = f"{ENV_SUPABASE_URL}/rest/v1/rpc/claim_ml_photos"
+    headers = {
+        "apikey": ENV_SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {ENV_SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, headers=headers, json={"batch_size": batch_size})
+        resp.raise_for_status()
+        return resp.json() or []
+
+
+def worker_loop():
+    callback_url = f"{ENV_SUPABASE_URL}/functions/v1/process-results"
+    print(f"ML worker started | batch={WORKER_BATCH} | idle={WORKER_IDLE_SECONDS}s")
+
+    while True:
+        try:
+            batch = claim_ml_photos(WORKER_BATCH)
+        except Exception as e:
+            print(f"Worker claim error: {e}")
+            time.sleep(WORKER_IDLE_SECONDS)
+            continue
+
+        if not batch:
+            time.sleep(WORKER_IDLE_SECONDS)
+            continue
+
+        print(f"Worker claimed {len(batch)} photo(s)")
+        for row in batch:
+            photo_id = row.get("id")
+            image_url = row.get("image_url")
+            if not photo_id or not image_url:
+                continue
+            # process_photo_task marca a foto como done/failed via callback ao fim.
+            process_photo_task(photo_id, image_url, callback_url, ENV_SUPABASE_SERVICE_KEY)
+
+
+@app.on_event("startup")
+def start_worker():
+    if not WORKER_ENABLED:
+        print("ML worker disabled (ML_WORKER_ENABLED=false)")
+        return
+    if not ENV_SUPABASE_URL or not ENV_SUPABASE_SERVICE_KEY:
+        print("ML worker NOT started: missing SUPABASE_URL/ML_SUPABASE_URL or SUPABASE_SERVICE_KEY")
+        return
+    threading.Thread(target=worker_loop, daemon=True, name="ml-worker").start()
