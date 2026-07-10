@@ -1,4 +1,13 @@
 import os
+
+# Limita o número de threads das libs nativas (OpenMP/BLAS/onnxruntime) ANTES de
+# importar numpy/onnxruntime. Sem isso, cada worker tenta usar TODOS os núcleos,
+# causando oversubscription (mais lento) quando roda com múltiplos workers.
+# Ajuste ML_NUM_THREADS no Coolify conforme (núcleos / WEB_CONCURRENCY).
+_threads = os.environ.get("ML_NUM_THREADS", "2")
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, _threads)
+
 import io
 import re
 from collections import Counter
@@ -19,6 +28,12 @@ ocr_instance = None
 face_app_instance = None
 
 ENV_SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+# Fotos de corrida costumam vir em 4000-6000px. Processar nesse tamanho gasta
+# muita RAM (principal causa de OOM/travamento) e tempo, sem ganho de precisão
+# para OCR de número de peito e detecção facial. Reduzimos o lado maior para
+# MAX_IMAGE_SIDE antes de processar.
+MAX_IMAGE_SIDE = int(os.environ.get("ML_MAX_IMAGE_SIDE", "1600"))
 
 
 def append_query_params(url: str, params: dict) -> str:
@@ -72,6 +87,25 @@ def download_image(url: str) -> np.ndarray:
     except Exception as e:
         print(f"Error downloading image: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Erro ao baixar imagem: {str(e)}")
+
+
+def downscale_image(img_np: np.ndarray, max_side: int = MAX_IMAGE_SIDE) -> np.ndarray:
+    """
+    Reduz a imagem para que o maior lado tenha no máximo `max_side` pixels,
+    preservando a proporção. Não faz upscale de imagens já pequenas.
+    """
+    h, w = img_np.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return img_np
+
+    scale = max_side / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    pil = Image.fromarray(img_np).resize((new_w, new_h), Image.Resampling.LANCZOS)
+    print(f"Downscaled image | {w}x{h} -> {new_w}x{new_h}")
+    return np.array(pil)
 
 
 def post_callback(callback_url: str, payload: dict, service_role_key: str | None = None):
@@ -137,25 +171,28 @@ def remove_top_and_bottom_noise(img_np: np.ndarray) -> np.ndarray:
 
 
 def generate_ocr_variants(img_np: np.ndarray) -> list[np.ndarray]:
+    """
+    Gera as 3 variantes de imagem mais eficazes para OCR de número de peito.
+    Reduzido de 6 para 3 variantes: cada variante é uma passada completa de OCR,
+    então cortar pela metade o número de variantes praticamente dobra a
+    velocidade sem perda relevante de acerto (as variantes removidas eram
+    incrementos marginais de contraste/sharpen sobre estas).
+    """
     pil = Image.fromarray(img_np)
     variants = []
 
-    variants.append(np.array(pil))
-
+    # 1) Upscale 2x — ajuda muito em texto pequeno (número distante/pequeno).
     up2 = pil.resize((pil.width * 2, pil.height * 2), Image.Resampling.LANCZOS)
     variants.append(np.array(up2))
 
+    # 2) Escala de cinza com alto contraste — realça o número contra a camisa.
     gray = ImageOps.grayscale(up2).convert("RGB")
-    variants.append(np.array(gray))
-
     high_contrast = ImageEnhance.Contrast(gray).enhance(2.2)
     variants.append(np.array(high_contrast))
 
+    # 3) Alto contraste + sharpen — bordas mais nítidas para dígitos borrados.
     sharp = high_contrast.filter(ImageFilter.SHARPEN)
     variants.append(np.array(sharp))
-
-    extra = ImageEnhance.Contrast(sharp).enhance(1.4).filter(ImageFilter.SHARPEN)
-    variants.append(np.array(extra))
 
     return variants
 
@@ -235,10 +272,10 @@ def run_ocr_on_region(img_np: np.ndarray, source: str) -> list[tuple[int, float]
     return found
 
 
-def extract_torso_regions(img_np: np.ndarray) -> list[np.ndarray]:
-    face_app = get_face_app()
-    faces = face_app.get(img_np)
-
+def extract_torso_regions(img_np: np.ndarray, faces: list) -> list[np.ndarray]:
+    # Recebe os rostos já detectados (detecção feita uma única vez em
+    # process_photo_task) em vez de rodar face_app.get de novo. Os bboxes são
+    # relativos a img_np (imagem completa após downscale).
     regions = []
 
     if not faces:
@@ -305,14 +342,16 @@ def select_best_bib_numbers(global_candidates: list[tuple[int, float]], torso_ca
     return ranking[:6]
 
 
-def extract_bib_numbers(img_np: np.ndarray) -> list[int]:
+def extract_bib_numbers(img_np: np.ndarray, faces: list) -> list[int]:
     cleaned = remove_top_and_bottom_noise(img_np)
 
     print("Running OCR on cleaned global image...")
     global_candidates = run_ocr_on_region(cleaned, source="global")
 
+    # Torso é recortado da imagem COMPLETA (não da versão "cleaned", que corta o
+    # rodapé e poderia cortar o torso). Usa os rostos já detectados.
     print("Estimating torso regions...")
-    torso_regions = extract_torso_regions(cleaned)
+    torso_regions = extract_torso_regions(img_np, faces)
 
     torso_candidates = []
     for idx, region in enumerate(torso_regions):
@@ -334,11 +373,18 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str, s
     try:
         print(f"Starting process_photo_task | photo_id={photo_id}")
         img = download_image(image_url)
+        img = downscale_image(img)
 
         face_app = get_face_app()
 
+        # Detecção facial UMA única vez — reusada para estimar o torso (OCR) e
+        # para gerar os embeddings. Antes rodava 2x (o modelo mais caro).
+        print("Running face detection...")
+        faces = face_app.get(img)
+        print(f"Faces detected: {len(faces)}")
+
         print("Running race bib extraction...")
-        numbers = extract_bib_numbers(img)
+        numbers = extract_bib_numbers(img, faces)
 
         if numbers:
             print("BIB NUMBERS DETECTED:", numbers)
@@ -354,8 +400,6 @@ async def process_photo_task(photo_id: str, image_url: str, callback_url: str, s
         else:
             print("NO BIB NUMBERS DETECTED")
 
-        print("Running face detection...")
-        faces = face_app.get(img)
         if faces:
             face_data = []
 
@@ -446,6 +490,7 @@ async def process_selfie(
         print("service_role_key received:", bool(service_role_key))
 
         img = download_image(image_url)
+        img = downscale_image(img)
 
         face_app = get_face_app()
         faces = face_app.get(img)
